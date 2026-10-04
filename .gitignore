@@ -1,0 +1,4 @@
+# Your Ambient keys, station and location (written by the settings panel)
+config.json
+config.json.tmp
+__pycache__/

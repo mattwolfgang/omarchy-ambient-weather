@@ -1,0 +1,9 @@
+{
+  "applicationKey": "your-ambient-application-key",
+  "apiKey": "your-ambient-api-key",
+  "deviceMac": "AA:BB:CC:DD:EE:FF",
+  "stationIp": "192.168.1.50",
+  "locationName": "Jasper, Arkansas",
+  "latitude": 36.0081,
+  "longitude": -93.1866
+}

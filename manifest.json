@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mattwolfgang.ambient-weather",
+  "name": "Ambient Weather",
+  "version": "1.0.0",
+  "author": "Matt Wolfgang",
+  "license": "MIT",
+  "description": "Your Ambient Weather station's live readings beside the National Weather Service forecast",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Ambient Weather",
+    "description": "Station temperature; click for station readings, the local forecast and settings",
+    "category": "Weather",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": { "refreshMinutes": 5 },
+    "schema": [
+      { "key": "refreshMinutes", "type": "integer", "label": "Refresh interval (minutes)", "min": 2, "max": 60, "step": 1, "defaultValue": 5 }
+    ]
+  }
+}
