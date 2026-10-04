@@ -553,7 +553,7 @@ Panel {
               linkColor: root.fg
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
-              text: "Create both keys at <a href=\"https://ambientweather.net/account\">ambientweather.net/account</a>. "
+              text: "Create both keys at <a href=\"https://ambientweather.net/account/keys\">ambientweather.net/account/keys</a>. "
                 + "They're saved only in this plugin's config.json, readable by you alone."
               onLinkActivated: function(link) { Qt.openUrlExternally(link) }
               HoverHandler { cursorShape: parent.hoveredLink !== "" ? Qt.PointingHandCursor : Qt.ArrowCursor }

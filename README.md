@@ -21,7 +21,7 @@ Everything is entered in the panel's settings view (the gear icon, top right):
 
 | Field | |
 |---|---|
-| Application key, API key | Required. Create both at [ambientweather.net/account](https://ambientweather.net/account). |
+| Application key, API key | Required. Create both at [ambientweather.net/account/keys](https://ambientweather.net/account/keys). |
 | Station MAC | Optional. Picks a station when your account has more than one. Otherwise the first station is used. |
 | Station IP | Optional. If you leave the MAC blank, the plugin reads the MAC from your console's local web interface when you save. This works with consoles running AMBWeatherPro firmware, such as the WS-2902. |
 | Forecast location | Optional. Search for a city and pick a result, or type a latitude and longitude. |
