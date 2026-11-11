@@ -11,6 +11,11 @@ Usage:
   fetch.py --show-config                     non-secret config summary
   fetch.py --save-config < settings.json     merge settings (one JSON line)
   fetch.py --geocode QUERY                   place search for the settings view
+  fetch.py --paste clipboard|primary         bounded clipboard read for the settings view
+
+Every input is bounded: HTTP bodies, files and stdin by size, network
+requests by an absolute deadline, and the strings passed on to the panel by
+length, so the JSON this prints is always small.
 """
 
 from __future__ import annotations
@@ -18,8 +23,13 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import math
 import os
 import re
+import selectors
+import signal
+import stat
+import subprocess
 import sys
 import time
 import urllib.error
@@ -41,6 +51,21 @@ GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 CONFIG_KEYS = ("apiKey", "applicationKey", "deviceMac", "stationIp", "locationName", "latitude", "longitude")
 SECRET_KEYS = ("apiKey", "applicationKey")
 MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
+CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f]+")
+
+# Size, time and length limits.
+HTTP_LIMIT = 2 * 1024 * 1024     # bytes in one HTTP response body
+FILE_LIMIT = 64 * 1024           # bytes in config.json, the cache, Omarchy's location file
+STDIN_LIMIT = 16 * 1024          # bytes of settings on stdin
+OUTPUT_LIMIT = 256 * 1024        # bytes of JSON printed for the panel
+PASTE_LIMIT = 4096               # bytes read from the clipboard
+PASTE_TIMEOUT = 2.0              # seconds to wait for the clipboard
+MAX_DEVICES = 50                 # Ambient stations looked at
+MAX_PERIODS = 8                  # forecast periods shown
+MAX_PLACES = 6                   # place search results
+KEY_MAX = 256                    # characters in an Ambient key
+TEXT_MAX = 200                   # characters in any other string
+NWS_HOST = "api.weather.gov"
 
 # Nerd-font weather glyphs, matching the built-in omarchy.weather widget.
 GLYPHS = {
@@ -76,34 +101,117 @@ NWS_ICON_FAMILY = {
 
 # ---------------------------------------------------------------- helpers
 
-def get_json(url: str, timeout: float = 10.0):
+class TimedOut(Exception):
+    pass
+
+
+class TooLarge(Exception):
+    pass
+
+
+def _on_alarm(signum, frame):
+    raise TimedOut()
+
+
+def get_json(url: str, timeout: float = 10.0, limit: int = HTTP_LIMIT):
+    """GET url as JSON within an absolute deadline and a body size limit.
+
+    The socket timeout only bounds each read, so an interval timer raises
+    TimedOut once `timeout` seconds have passed in total. (A DNS lookup can
+    outlast it; the panel kills this script at its own deadline as well.)"""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.load(resp)
+    previous = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            length = resp.headers.get("Content-Length", "")
+            if length.isdigit() and int(length) > limit:
+                raise TooLarge()
+            body = bytearray()
+            while True:
+                chunk = resp.read(min(65536, limit + 1 - len(body)))
+                if not chunk:
+                    break
+                body += chunk
+                if len(body) > limit:
+                    raise TooLarge()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    return json.loads(body)
+
+
+def failure(exc: Exception) -> str:
+    if isinstance(exc, TimedOut):
+        return "timed out"
+    if isinstance(exc, TooLarge):
+        return "reply too large"
+    return type(exc).__name__
 
 
 def num(value):
-    if value is None or value == "":
+    if value is None or value == "" or isinstance(value, bool):
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return value if math.isfinite(value) else None
 
 
-def read_json_file(path: Path) -> dict:
+def text(value, limit: int = TEXT_MAX) -> str:
+    """A display string: control characters flattened, length capped."""
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return ""
+    return CONTROL_RE.sub(" ", str(value)[:limit * 2]).strip()[:limit]
+
+
+def as_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def read_json_file(path: Path, limit: int = FILE_LIMIT) -> dict:
+    """A JSON object from a regular file of at most `limit` bytes, else {}."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
         return {}
-    return data if isinstance(data, dict) else {}
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return {}
+            raw = fh.read(limit + 1)
+    except OSError:
+        return {}
+    if len(raw) > limit:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return {}
+    return as_dict(data)
 
 
 # ---------------------------------------------------------------- config
 
 def load_config(path: Path) -> dict:
     data = read_json_file(path)
-    return {k: data.get(k) for k in CONFIG_KEYS if data.get(k) not in (None, "")}
+    config = {}
+    for key in CONFIG_KEYS:
+        value = data.get(key)
+        if key in ("latitude", "longitude"):
+            value = num(value)
+        elif isinstance(value, str):
+            value = value.strip()[:KEY_MAX if key in SECRET_KEYS else TEXT_MAX]
+        else:
+            value = None
+        if value not in (None, ""):
+            config[key] = value
+    return config
 
 
 def write_config(path: Path, config: dict) -> None:
@@ -148,8 +256,8 @@ def station_mac_from_ip(host: str) -> str | None:
     """Ask the console for its MAC. AMBWeatherPro-firmware consoles (e.g. the
     WS-2902) answer /get_network_info on the LAN; others simply don't."""
     try:
-        data = get_json(f"http://{host}/get_network_info", timeout=3)
-        return normalize_mac(str(data.get("mac", "")))
+        data = as_dict(get_json(f"http://{host}/get_network_info", timeout=3, limit=FILE_LIMIT))
+        return normalize_mac(text(data.get("mac", ""), 64))
     except Exception:
         return None
 
@@ -161,10 +269,12 @@ def save_config(path: Path, incoming: dict) -> dict:
     for key in SECRET_KEYS:  # blank means "keep the saved key"
         value = str(incoming.get(key) or "").strip()
         if value:
+            if len(value) > KEY_MAX or not re.fullmatch(r"[\x21-\x7e]+", value):
+                raise ValueError("Keys are single words of printable characters")
             config[key] = value
 
     for key, normalize in (("deviceMac", normalize_mac), ("stationIp", normalize_host)):
-        value = str(incoming.get(key) or "").strip()
+        value = str(incoming.get(key) or "").strip()[:TEXT_MAX]
         if value:
             config[key] = normalize(value)
         else:
@@ -178,12 +288,12 @@ def save_config(path: Path, incoming: dict) -> dict:
         else:
             notes.append(f"Couldn't read a MAC from {config['stationIp']}; using the first station on the account")
 
-    lat = str(incoming.get("latitude") or "").strip()
-    lon = str(incoming.get("longitude") or "").strip()
+    lat = str(incoming.get("latitude") or "").strip()[:64]
+    lon = str(incoming.get("longitude") or "").strip()[:64]
     if lat or lon:
         try:
             lat_f, lon_f = float(lat), float(lon)
-        except ValueError:
+        except (ValueError, OverflowError):
             raise ValueError("Latitude and longitude must both be numbers")
         if not (-90 <= lat_f <= 90 and -180 <= lon_f <= 180):
             raise ValueError("Latitude must be -90…90 and longitude -180…180")
@@ -192,7 +302,7 @@ def save_config(path: Path, incoming: dict) -> dict:
         config.pop("latitude", None)
         config.pop("longitude", None)
 
-    name = str(incoming.get("locationName") or "").strip()
+    name = text(incoming.get("locationName"))
     if name and "latitude" in config:
         config["locationName"] = name
     else:
@@ -219,23 +329,26 @@ def fetch_station(config: dict) -> tuple[dict, tuple[float, float] | None]:
             return {"error": "Ambient rejected the keys; check them in settings", "needsSetup": True}, None
         return {"error": f"Ambient request failed (HTTP {exc.code})"}, None
     except Exception as exc:
-        return {"error": f"Ambient request failed ({type(exc).__name__})"}, None
+        return {"error": f"Ambient request failed ({failure(exc)})"}, None
+    devices = [d for d in as_list(devices)[:MAX_DEVICES] if isinstance(d, dict)]
     if not devices:
         return {"error": "No stations on this Ambient account"}, None
 
     wanted_mac = str(config.get("deviceMac", "")).lower()
     device = devices[0]
     if wanted_mac:
-        device = next((d for d in devices if str(d.get("macAddress", "")).lower() == wanted_mac), device)
+        device = next((d for d in devices if text(d.get("macAddress"), 64).lower() == wanted_mac), device)
 
-    data = device.get("lastData") or {}
-    info = device.get("info") or {}
-    coords = ((info.get("coords") or {}).get("coords")) or {}
+    data = as_dict(device.get("lastData"))
+    info = as_dict(device.get("info"))
+    coords = as_dict(as_dict(info.get("coords")).get("coords"))
     lat, lon = num(coords.get("lat")), num(coords.get("lon"))
-    observed = data.get("dateutc")
+    if lat is None or lon is None or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        lat = lon = None
+    observed = num(data.get("dateutc"))
     station = {
-        "name": info.get("name") or info.get("location") or "Weather Station",
-        "observedAt": int(observed) if isinstance(observed, (int, float)) else None,
+        "name": text(info.get("name"), 80) or text(info.get("location"), 80) or "Weather Station",
+        "observedAt": int(observed) if observed is not None and 0 < observed < 1e14 else None,
         "tempF": num(data.get("tempf")),
         "feelsLikeF": num(data.get("feelsLike")),
         "dewPointF": num(data.get("dewPoint")),
@@ -259,10 +372,10 @@ def fetch_station(config: dict) -> tuple[dict, tuple[float, float] | None]:
 def resolve_location(config: dict, station_coords) -> tuple[float, float, str] | None:
     """Plugin settings, then Omarchy's weather location, then the station's own coordinates."""
     if num(config.get("latitude")) is not None and num(config.get("longitude")) is not None:
-        return float(config["latitude"]), float(config["longitude"]), config.get("locationName", "")
+        return float(config["latitude"]), float(config["longitude"]), text(config.get("locationName"), 120)
     shared = read_json_file(OMARCHY_LOCATION)
     if num(shared.get("latitude")) is not None and num(shared.get("longitude")) is not None:
-        return float(shared["latitude"]), float(shared["longitude"]), str(shared.get("name") or "")
+        return float(shared["latitude"]), float(shared["longitude"]), text(shared.get("name"), 120)
     if station_coords:
         return station_coords[0], station_coords[1], ""
     return None
@@ -271,17 +384,17 @@ def resolve_location(config: dict, station_coords) -> tuple[float, float, str] |
 def nws_forecast_url(lat: float, lon: float) -> tuple[str, str]:
     """Resolve (and cache) the NWS gridpoint forecast URL for a coordinate."""
     cache_file = CACHE_DIR / f"nws-point-{lat:.4f},{lon:.4f}.json"
-    try:
-        cached = json.loads(cache_file.read_text())
-        if time.time() - cached.get("savedAt", 0) < 7 * 86400:
-            return cached["forecast"], cached["place"]
-    except (OSError, ValueError, KeyError):
-        pass
+    cached = read_json_file(cache_file)
+    saved_at = num(cached.get("savedAt")) or 0
+    if 0 <= time.time() - saved_at < 7 * 86400 and is_nws_url(cached.get("forecast")):
+        return cached["forecast"], text(cached.get("place"), 120)
 
-    props = get_json(NWS_POINTS_URL.format(lat=f"{lat:.4f}", lon=f"{lon:.4f}"))["properties"]
-    rel = (props.get("relativeLocation") or {}).get("properties") or {}
-    place = ", ".join(p for p in (rel.get("city"), rel.get("state")) if p) or f"{lat:.2f}, {lon:.2f}"
-    forecast = props["forecast"]
+    props = as_dict(as_dict(get_json(NWS_POINTS_URL.format(lat=f"{lat:.4f}", lon=f"{lon:.4f}"))).get("properties"))
+    rel = as_dict(as_dict(props.get("relativeLocation")).get("properties"))
+    place = ", ".join(p for p in (text(rel.get("city"), 80), text(rel.get("state"), 40)) if p) or f"{lat:.2f}, {lon:.2f}"
+    forecast = props.get("forecast")
+    if not is_nws_url(forecast):
+        raise ValueError("unexpected forecast URL")
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps({"forecast": forecast, "place": place, "savedAt": time.time()}))
@@ -290,11 +403,19 @@ def nws_forecast_url(lat: float, lon: float) -> tuple[str, str]:
     return forecast, place
 
 
+def is_nws_url(url) -> bool:
+    """Only follow forecast links that stay on the NWS API over HTTPS."""
+    if not isinstance(url, str) or len(url) > 512:
+        return False
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme == "https" and parsed.hostname == NWS_HOST
+
+
 def glyph_for(icon_url: str, is_day: bool) -> str:
     # e.g. https://api.weather.gov/icons/land/day/tsra_sct,40/sct?size=medium
     # path parts: ["", "icons", "land", "day", "tsra_sct,40", "sct"]; the
     # first code describes the start of the period.
-    path = urllib.parse.urlparse(icon_url or "").path.split("/")
+    path = urllib.parse.urlparse(text(icon_url, 512)).path.split("/")
     code = path[4].split(",")[0] if len(path) > 4 else ""
     day_glyph, night_glyph = GLYPHS[NWS_ICON_FAMILY.get(code, "cloudy")]
     return day_glyph if is_day else night_glyph
@@ -306,48 +427,112 @@ def fetch_forecast(location) -> dict:
     lat, lon, name = location
     try:
         url, place = nws_forecast_url(lat, lon)
-        props = get_json(url, timeout=15)["properties"]
+        props = as_dict(as_dict(get_json(url, timeout=15)).get("properties"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return {"error": "The NWS forecast only covers US locations"}
         return {"error": f"NWS forecast unavailable (HTTP {exc.code})"}
     except Exception as exc:
-        return {"error": f"NWS forecast unavailable ({type(exc).__name__})"}
+        return {"error": f"NWS forecast unavailable ({failure(exc)})"}
 
     periods = []
-    for p in props.get("periods", [])[:8]:
-        pop = (p.get("probabilityOfPrecipitation") or {}).get("value")
-        wind = " ".join(x for x in (p.get("windDirection"), p.get("windSpeed")) if x)
+    for p in as_list(props.get("periods"))[:MAX_PERIODS]:
+        p = as_dict(p)
+        temp = num(p.get("temperature"))
+        if temp is None:
+            continue
+        pop = num(as_dict(p.get("probabilityOfPrecipitation")).get("value"))
+        is_day = p.get("isDaytime") is True
         periods.append({
-            "name": p.get("name", ""),
-            "isDaytime": bool(p.get("isDaytime")),
-            "temp": p.get("temperature"),
-            "short": p.get("shortForecast", ""),
-            "detailed": p.get("detailedForecast", ""),
-            "precip": pop if pop is not None else 0,
-            "wind": wind,
-            "icon": glyph_for(p.get("icon", ""), bool(p.get("isDaytime"))),
+            "name": text(p.get("name"), 40),
+            "isDaytime": is_day,
+            "temp": round(temp),
+            "short": text(p.get("shortForecast"), 120),
+            "precip": round(max(0, min(100, pop))) if pop is not None else 0,
+            "icon": glyph_for(p.get("icon"), is_day),
         })
-    return {"place": name or place, "updated": props.get("updateTime") or props.get("generatedAt"), "periods": periods}
+    updated = text(props.get("updateTime"), 40) or text(props.get("generatedAt"), 40)
+    return {"place": text(name, 120) or place, "updated": updated, "periods": periods}
 
 
 # ---------------------------------------------------------------- geocoding
 
 def geocode(query: str) -> dict:
-    url = GEOCODE_URL + "?" + urllib.parse.urlencode({"name": query, "count": 6, "language": "en", "format": "json"})
+    query = text(query, 100)
+    if len(query) < 2:
+        return {"error": "Type at least two characters", "results": []}
+    url = GEOCODE_URL + "?" + urllib.parse.urlencode({"name": query, "count": MAX_PLACES, "language": "en", "format": "json"})
     try:
-        results = get_json(url, timeout=8).get("results") or []
+        results = as_list(as_dict(get_json(url, timeout=8)).get("results"))
     except Exception as exc:
-        return {"error": f"Location search failed ({type(exc).__name__})", "results": []}
+        return {"error": f"Location search failed ({failure(exc)})", "results": []}
     out = []
-    for r in results:
-        parts = [r.get("name"), r.get("admin1"), None if r.get("country_code") == "US" else r.get("country")]
+    for r in results[:MAX_PLACES]:
+        r = as_dict(r)
+        lat, lon = num(r.get("latitude")), num(r.get("longitude"))
+        if lat is None or lon is None or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        country = None if r.get("country_code") == "US" else text(r.get("country"), 60)
+        parts = [text(r.get("name"), 80), text(r.get("admin1"), 60), country]
         out.append({
             "name": ", ".join(p for p in parts if p),
-            "latitude": round(float(r["latitude"]), 4),
-            "longitude": round(float(r["longitude"]), 4),
+            "latitude": round(lat, 4),
+            "longitude": round(lon, 4),
         })
     return {"results": out}
+
+
+# ---------------------------------------------------------------- clipboard
+
+def read_clipboard(selection: str) -> dict:
+    """At most PASTE_LIMIT bytes of clipboard text within PASTE_TIMEOUT seconds.
+
+    The panel's text fields paste through this instead of letting Qt read the
+    clipboard itself, which has no size or time limit. wl-paste runs in its
+    own process group, killed when this returns."""
+    cmd = ["wl-paste", "--no-newline", "--type", "text"] + (["--primary"] if selection == "primary" else [])
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return {"ok": False, "error": "Couldn't read the clipboard; wl-paste (wl-clipboard) is needed"}
+    deadline = time.monotonic() + PASTE_TIMEOUT
+    out = bytearray()
+    error = None
+    try:
+        fd = proc.stdout.fileno()
+        with selectors.DefaultSelector() as sel:
+            sel.register(fd, selectors.EVENT_READ)
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    error = "The clipboard didn't answer in time"
+                    break
+                if not sel.select(left):
+                    continue
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                out += chunk
+                if len(out) > PASTE_LIMIT:
+                    error = f"The clipboard holds more than {PASTE_LIMIT} bytes, too much for this field"
+                    break
+        if error is None:
+            try:
+                if proc.wait(timeout=max(0.05, deadline - time.monotonic())) != 0:
+                    error = "The clipboard has no text"
+            except subprocess.TimeoutExpired:
+                error = "The clipboard didn't answer in time"
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.stdout.close()
+        proc.wait()
+    if error:
+        return {"ok": False, "error": error}
+    return {"ok": True, "text": CONTROL_RE.sub(" ", out.decode("utf-8", "replace")).strip()}
 
 
 # ---------------------------------------------------------------- main
@@ -359,6 +544,7 @@ def main() -> int:
     mode.add_argument("--show-config", action="store_true")
     mode.add_argument("--save-config", action="store_true")
     mode.add_argument("--geocode", metavar="QUERY")
+    mode.add_argument("--paste", choices=("clipboard", "primary"))
     args = parser.parse_args()
     config_path = Path(os.path.expanduser(args.config))
 
@@ -366,14 +552,22 @@ def main() -> int:
         out = {"config": config_summary(load_config(config_path))}
     elif args.save_config:
         try:
-            incoming = json.loads(sys.stdin.readline() or "{}")
+            line = sys.stdin.readline(STDIN_LIMIT + 1)
+            if len(line) > STDIN_LIMIT:
+                raise ValueError("Settings are too long")
+            try:
+                incoming = json.loads(line or "{}")
+            except RecursionError:
+                raise ValueError("Settings must be a JSON object")
             if not isinstance(incoming, dict):
                 raise ValueError("Settings must be a JSON object")
             out = save_config(config_path, incoming)
         except (ValueError, OSError) as exc:
             out = {"ok": False, "message": str(exc)}
     elif args.geocode is not None:
-        out = geocode(args.geocode.strip())
+        out = geocode(args.geocode)
+    elif args.paste:
+        out = read_clipboard(args.paste)
     else:
         config = load_config(config_path)
         station, station_coords = fetch_station(config)
@@ -382,7 +576,10 @@ def main() -> int:
             "forecast": fetch_forecast(resolve_location(config, station_coords)),
             "fetchedAt": int(time.time()),
         }
-    json.dump(out, sys.stdout, ensure_ascii=False)
+    encoded = json.dumps(out, ensure_ascii=False, allow_nan=False)
+    if len(encoded.encode("utf-8")) > OUTPUT_LIMIT:  # can't happen with the limits above; a backstop
+        encoded = json.dumps({"error": "Result too large"})
+    sys.stdout.write(encoded)
     return 0
 
 

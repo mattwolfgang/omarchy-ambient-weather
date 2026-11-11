@@ -51,7 +51,8 @@ Panel {
   property string settingsMessage: ""
   property bool settingsError: false
   property var locationResults: []
-  property bool saving: saveProc.running
+  readonly property bool saving: saveHelper.waiting
+  readonly property bool searching: geocodeHelper.waiting
 
   function open() {
     root.controller.show()
@@ -65,10 +66,8 @@ Panel {
   function toggle() { root.opened ? root.close() : root.open() }
 
   function refresh() {
-    if (fetchProc.running) return
-    loading = true
-    fetchProc.command = ["python3", fetchScript]
-    fetchProc.running = true
+    if (fetchHelper.waiting) return
+    loading = fetchHelper.run([], "")
   }
 
   function openSettings() {
@@ -79,7 +78,7 @@ Panel {
     apiKeyField.text = ""
     appKeyField.text = ""
     showSettings = true
-    configProc.running = true
+    configHelper.run(["--show-config"], "")
     Qt.callLater(function() { appKeyField.field.forceActiveFocus() })
   }
 
@@ -90,29 +89,32 @@ Panel {
     keyCatcher.forceActiveFocus()
   }
 
+  function str(value, limit) {
+    return typeof value === "string" ? value.slice(0, limit || 200) : ""
+  }
+
   function fillSettings(config) {
     savedConfig = config
-    macField.text = config.deviceMac || ""
-    ipField.text = config.stationIp || ""
-    locationField.text = config.locationName || ""
-    latField.text = config.latitude || ""
-    lonField.text = config.longitude || ""
+    macField.text = str(config.deviceMac)
+    ipField.text = str(config.stationIp)
+    locationField.text = str(config.locationName)
+    latField.text = str(config.latitude, 32)
+    lonField.text = str(config.longitude, 32)
   }
 
   function searchLocation() {
-    var q = locationField.text.trim()
-    if (q.length < 2 || geocodeProc.running) return
+    var q = locationField.text.trim().slice(0, 100)
+    if (q.length < 2 || searching) return
     locationResults = []
     settingsMessage = "Searching…"
     settingsError = false
-    geocodeProc.command = ["python3", fetchScript, "--geocode", q]
-    geocodeProc.running = true
+    geocodeHelper.run(["--geocode", q], "")
   }
 
   function pickLocation(place) {
-    locationField.text = place.name
-    latField.text = String(place.latitude)
-    lonField.text = String(place.longitude)
+    locationField.text = str(place.name)
+    latField.text = String(Number(place.latitude))
+    lonField.text = String(Number(place.longitude))
     locationResults = []
     settingsMessage = ""
   }
@@ -122,7 +124,7 @@ Panel {
     settingsMessage = "Saving…"
     settingsError = false
     // Keys travel over stdin, never argv. Blank key fields keep the saved keys.
-    saveProc.payload = JSON.stringify({
+    saveHelper.run(["--save-config"], JSON.stringify({
       apiKey: apiKeyField.text.trim(),
       applicationKey: appKeyField.text.trim(),
       deviceMac: macField.text.trim(),
@@ -130,9 +132,7 @@ Panel {
       locationName: locationField.text.trim(),
       latitude: latField.text.trim(),
       longitude: lonField.text.trim()
-    })
-    saveProc.command = ["python3", fetchScript, "--save-config"]
-    saveProc.running = true
+    }))
   }
 
   function fmt(value, digits, suffix) {
@@ -153,91 +153,88 @@ Panel {
     return "Updated " + Qt.formatTime(d, "h:mm AP") + (mins >= 2 ? " (" + mins + " min ago)" : "")
   }
 
-  Process {
-    id: fetchProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.loading = false
-        try {
-          var data = JSON.parse(String(text || ""))
-          if (data.station && !data.station.error) {
-            root.station = data.station
-            root.stationError = ""
-            root.needsSetup = false
-          } else {
-            root.stationError = data.station ? data.station.error : "No station data"
-            root.needsSetup = !!(data.station && data.station.needsSetup)
-            if (root.needsSetup) root.station = null
-          }
-          if (data.forecast && !data.forecast.error) {
-            root.forecast = data.forecast
-            root.forecastError = ""
-          } else {
-            root.forecastError = data.forecast ? data.forecast.error : "No forecast data"
-          }
-        } catch (e) {
-          root.stationError = root.forecastError = "Fetch failed"
-        }
+  // Each helper has a deadline and a reply size limit (see Helper.qml);
+  // fetch.py also bounds every network, file and clipboard read itself.
+  Helper {
+    id: fetchHelper
+    script: root.fetchScript
+    // Three network requests of at most 15 s each, plus slack.
+    timeoutMs: 60000
+    onDone: function(data, error) {
+      root.loading = false
+      if (!data) {
+        root.stationError = root.forecastError = "Fetch failed (" + error + ")"
+        return
       }
-    }
-    onExited: function(code) { if (code !== 0) root.loading = false }
-  }
-
-  Process {
-    id: configProc
-    command: ["python3", root.fetchScript, "--show-config"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try { root.fillSettings(JSON.parse(String(text || "")).config || {}) } catch (e) {}
+      var station = data.station && typeof data.station === "object" ? data.station : null
+      var forecast = data.forecast && typeof data.forecast === "object" ? data.forecast : null
+      if (station && !station.error) {
+        root.station = station
+        root.stationError = ""
+        root.needsSetup = false
+      } else {
+        root.stationError = station ? root.str(station.error) : "No station data"
+        root.needsSetup = !!(station && station.needsSetup)
+        if (root.needsSetup) root.station = null
+      }
+      if (forecast && !forecast.error && Array.isArray(forecast.periods)) {
+        root.forecast = forecast
+        root.forecastError = ""
+      } else {
+        root.forecastError = forecast ? root.str(forecast.error) || "No forecast data" : "No forecast data"
       }
     }
   }
 
-  Process {
-    id: saveProc
-    property string payload: ""
-    stdinEnabled: true
-    onStarted: {
-      write(payload + "\n")
-      payload = ""
-    }
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var result = null
-        try { result = JSON.parse(String(text || "")) } catch (e) {}
-        if (result && result.ok) {
-          root.fillSettings(result.config || {})
-          root.settingsMessage = result.message || "Saved"
-          root.settingsError = false
-          apiKeyField.text = ""
-          appKeyField.text = ""
-          root.station = null
-          root.forecast = null
-          root.refresh()
-          if (!result.message || result.message === "Saved") root.closeSettings()
-        } else {
-          root.settingsMessage = result && result.message ? result.message : "Couldn't save settings"
-          root.settingsError = true
-        }
+  Helper {
+    id: configHelper
+    script: root.fetchScript
+    timeoutMs: 10000
+    onDone: function(data, error) {
+      if (data && data.config && typeof data.config === "object") root.fillSettings(data.config)
+      else {
+        root.settingsMessage = "Couldn't read settings (" + error + ")"
+        root.settingsError = true
       }
     }
   }
 
-  Process {
-    id: geocodeProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var result = null
-        try { result = JSON.parse(String(text || "")) } catch (e) {}
-        root.locationResults = result && result.results ? result.results : []
-        root.settingsError = !!(result && result.error) || root.locationResults.length === 0
-        root.settingsMessage = result && result.error ? result.error
-          : (root.locationResults.length === 0 ? "No places found" : "")
+  Helper {
+    id: saveHelper
+    script: root.fetchScript
+    // Reading the MAC from the console takes up to 3 s.
+    timeoutMs: 20000
+    onDone: function(result, error) {
+      if (result && result.ok) {
+        root.fillSettings(result.config && typeof result.config === "object" ? result.config : {})
+        var message = root.str(result.message) || "Saved"
+        root.settingsMessage = message
+        root.settingsError = false
+        apiKeyField.text = ""
+        appKeyField.text = ""
+        root.station = null
+        root.forecast = null
+        root.refresh()
+        if (message === "Saved") root.closeSettings()
+      } else {
+        root.settingsMessage = result ? root.str(result.message) || "Couldn't save settings"
+          : "Couldn't save settings (" + error + ")"
+        root.settingsError = true
       }
+    }
+  }
+
+  Helper {
+    id: geocodeHelper
+    script: root.fetchScript
+    timeoutMs: 15000
+    onDone: function(result, error) {
+      var places = result && Array.isArray(result.results) ? result.results.slice(0, 6) : []
+      root.locationResults = places
+      if (!result) root.settingsMessage = "Location search failed (" + error + ")"
+      else if (result.error) root.settingsMessage = root.str(result.error)
+      else root.settingsMessage = places.length === 0 ? "No places found" : ""
+      root.settingsError = !result || !!result.error || places.length === 0
     }
   }
 
@@ -284,7 +281,7 @@ Panel {
   // A labelled text input for the settings form.
   component Field: Column {
     property alias label: fieldLabel.text
-    property alias hint: fieldHint.text
+    property string hint: ""
     property alias field: input
     property alias text: input.text
     property alias placeholderText: input.placeholderText
@@ -292,15 +289,17 @@ Panel {
     signal accepted()
     spacing: Style.space(4)
     Caption { id: fieldLabel }
-    TextField {
+    BoundedTextField {
       id: input
       width: parent.width
+      helperScript: root.fetchScript
       foreground: root.fg
       font.family: root.fontFamily
       onAccepted: parent.accepted()
     }
     Caption {
       id: fieldHint
+      text: input.pasteError !== "" ? input.pasteError : parent.hint
       visible: text !== ""
       width: parent.width
       wrapMode: Text.WordWrap
@@ -636,12 +635,28 @@ Panel {
                   width: parent.width
                   leftAlign: true
                   focusable: true
-                  text: modelData.name + "   " + modelData.latitude + ", " + modelData.longitude
+                  text: root.str(modelData.name, 160) + "   " + Number(modelData.latitude) + ", " + Number(modelData.longitude)
                   iconText: "\uf041" // nf-fa-map_marker
                   foreground: root.fg
                   fontFamily: root.fontFamily
                   onClicked: root.pickLocation(modelData)
                 }
+              }
+
+              // Credit for the place search, beside its results.
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.StyledText
+                color: root.dim
+                linkColor: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                text: "Place search by <a href=\"https://open-meteo.com/\">Open-Meteo.com</a> "
+                  + "(<a href=\"https://creativecommons.org/licenses/by/4.0/\">CC BY 4.0</a>), "
+                  + "with location data from <a href=\"https://www.geonames.org/\">GeoNames</a>."
+                onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+                HoverHandler { cursorShape: parent.hoveredLink !== "" ? Qt.PointingHandCursor : Qt.ArrowCursor }
               }
             }
 

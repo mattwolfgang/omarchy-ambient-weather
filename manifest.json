@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.mattwolfgang.ambient-weather",
   "name": "Ambient Weather",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "Matt Wolfgang",
   "license": "MIT",
   "description": "Your Ambient Weather station's live readings beside the National Weather Service forecast",

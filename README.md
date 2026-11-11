@@ -47,7 +47,14 @@ The refresh interval (default 5 minutes) is a bar setting:
 - `python3` (standard library only). No other dependencies.
 - Readings come from the Ambient Weather cloud API and are shown in US units (°F, mph, inches).
 - The forecast comes from the US National Weather Service, which needs no key but only covers US locations.
-- Location search uses the free [Open-Meteo geocoding API](https://open-meteo.com/en/docs/geocoding-api).
+- Location search uses the free [Open-Meteo geocoding API](https://open-meteo.com/en/docs/geocoding-api)
+  ([Open-Meteo.com](https://open-meteo.com/), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)),
+  with location data from [GeoNames](https://www.geonames.org/). The panel credits both beside the search
+  results. Open-Meteo's [terms](https://open-meteo.com/en/terms) allow the free API for non-commercial use
+  only, which covers a personal desktop widget like this one.
+- Pasting into the settings fields reads at most 4 KiB of clipboard text within 2 seconds, through
+  `wl-paste` (wl-clipboard, included with Omarchy). Every network request, file read and result has a
+  size and time limit, and the panel stops any helper that runs past its deadline.
 
 ## Remove
 
