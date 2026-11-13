@@ -140,6 +140,15 @@ Panel {
     return Number(value).toFixed(digits) + (suffix || "")
   }
 
+  // Values crossing a helper signal arrive as JSValue lists that fail
+  // Array.isArray; accept anything array-like and return a real JS array.
+  function listFrom(value) {
+    if (!value || typeof value === "string" || typeof value.length !== "number") return []
+    var out = []
+    for (var i = 0; i < value.length; i++) out.push(value[i])
+    return out
+  }
+
   function compass(deg) {
     if (deg === null || deg === undefined) return ""
     var dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
@@ -177,7 +186,7 @@ Panel {
         root.needsSetup = !!(station && station.needsSetup)
         if (root.needsSetup) root.station = null
       }
-      if (forecast && !forecast.error && Array.isArray(forecast.periods)) {
+      if (forecast && !forecast.error && listFrom(forecast.periods).length > 0) {
         root.forecast = forecast
         root.forecastError = ""
       } else {
@@ -229,7 +238,7 @@ Panel {
     script: root.fetchScript
     timeoutMs: 15000
     onDone: function(result, error) {
-      var places = result && Array.isArray(result.results) ? result.results.slice(0, 6) : []
+      var places = result ? listFrom(result.results).slice(0, 6) : []
       root.locationResults = places
       if (!result) root.settingsMessage = "Location search failed (" + error + ")"
       else if (result.error) root.settingsMessage = root.str(result.error)
